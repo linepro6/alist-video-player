@@ -104,7 +104,6 @@ import { useRoute, useRouter } from "vue-router";
 import * as api from "@/api";
 import Hls from "hls.js";
 import Artplayer from 'artplayer';
-import * as idb from "idb";
 import { mdiMovie } from "@mdi/js";
 import playingIcon from "@/assets/playing.png";
 import { parseAssFonts, formatPlayDuration } from "@/utils";
@@ -394,6 +393,111 @@ function awaitForLibassReady(options: any) {
   });
 }
 
+class ArtplayerQualityControl {
+  art: Artplayer
+  hls: Hls
+  control: any
+  qualities: any[]
+  currentSelector: any
+  select: any
+
+  constructor(qualities: any[]) {
+    const selectors = this.generateSelectors(qualities);
+    const select = (item: any) => {
+      if (videoDetail.value.provider === "139Yun") {
+        if (this.currentSelector.type === "m3u8" && item.type !== "m3u8") {
+          this.hls.detachMedia();
+        } else if (this.hls && this.currentSelector.type !== "m3u8" && item.type === "m3u8") {
+          this.hls.attachMedia(this.art.video);
+        }
+      }
+      this.currentSelector.default = false;
+      item.default = true;
+      this.currentSelector = item;
+      settingsStore.quality = item.html;
+      this.art.type = item.type;
+      if (typeof item.level === "number") {
+        this.hls.currentLevel = item.level;
+      } else {
+        this.art.switchQuality(item.url);
+      }
+      return item.html;
+    }
+    this.control = {
+      name: 'quality',
+      position: 'right',
+      index: 10,
+      style: { marginRight: "10px" },
+      html: this.currentSelector.html,
+      selector: selectors,
+      onSelect: select
+    };
+    this.select = select;
+  }
+
+  generateSelectors(qualities: any[]) {
+    this.qualities = qualities;
+    this.currentSelector = null;
+    const selectors = [];
+    for (const item of qualities) {
+      const selector = {
+        default: item.html === settingsStore.quality,
+        ...item
+      };
+      if (selector.default) {
+        this.currentSelector = item;
+      }
+      selectors.push(selector);
+      item.selector = selector;
+    }
+
+    if (!this.currentSelector) {
+      if (selectors.length > 1 && selectors[0].html === "原画") {
+        this.currentSelector = selectors[1];
+      } else {
+        this.currentSelector = selectors[0];
+      }
+      this.currentSelector.default = true;
+    }
+    return selectors;
+  }
+
+  update(qualities: any[]) {
+    this.control.selector = this.generateSelectors(qualities);
+    this.control.html = this.currentSelector.html;
+    this.art?.controls.update(this.control);
+  }
+
+  switch(index: number) {
+    const item = this.control.selector[index];
+    this.control.html = this.select(item);
+    this.art.controls.update(this.control);
+  }
+}
+
+function loadM3U8Quality(url: string): any {
+  return new Promise((resolve, reject) => {
+    const hls = new Hls();
+    hls.loadSource(url);
+    hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+      const qualities = [];
+      const levels = data.levels.map((item: any, index) => {
+        item.index = index;
+        return item;
+      }).sort((a: any, b: any) => (a.width < b.width ? 1 : -1));
+      for (const level of levels) {
+        qualities.push({
+          html: `${level.height}P`,
+          level: level.index,
+          type: "m3u8",
+          url
+        });
+      }
+      resolve([hls, qualities]);
+    });
+  });
+}
+
 async function videoInit() {
   try {
     fontsWarnings.value.notFound = [];
@@ -407,66 +511,39 @@ async function videoInit() {
       videoDetail.value = detailResp?.data;
     }
     const qualities: any[] = [];
-    let defaultQuality = null;
-
     const qualityOrigin = {
-      default: settingsStore.quality === '原画',
       html: "原画",
       url: videoDetail.value.raw_url,
       type: ""
     }
     qualities.push(qualityOrigin);
-    if (qualityOrigin.default) {
-      defaultQuality = qualityOrigin
-    }
+
+    let hls: Hls | null = null;
 
     if (videoDetail.value.provider === "AliyundriveOpen") {
       const resp = await api.getAliyunVideoPreview(currentPath.value);
       const transcoding = resp.data.video_preview_play_info.live_transcoding_task_list.sort((a: any, b: any) => (a.template_width < b.template_width ? 1 : -1));
       for (const item of transcoding) {
         const html = `${item.template_height}P`;
-        const defaultItem = (settingsStore.quality === html);
         const qualityItem = {
-          default: defaultItem,
-          html: `${item.template_height}P`,
+          html: html,
           url: item.url,
           type: "m3u8"
         }
-        if (defaultItem) {
-          defaultQuality = qualityItem;
-        }
         qualities.push(qualityItem);
       }
+    } else if (videoDetail.value.provider === "139Yun") {
+      const resp = await api.getAliyunVideoPreview(currentPath.value);
+      const m3u8Url = resp?.data?.previewInfo?.url;
+      const [qhls, m3u8Qualities] = await loadM3U8Quality(m3u8Url);
+      qualities.push(...m3u8Qualities);
+      hls = qhls;
     }
 
-    if (!defaultQuality) {
-      if (qualities.length > 1) {
-        defaultQuality = qualities[1];
-      } else {
-        defaultQuality = qualityOrigin;
-      }
-      defaultQuality.default = true;
-    }
+    const control = new ArtplayerQualityControl(qualities);
+    const currentQuality = control.currentSelector;
 
-    const controls = [];
-    if (qualities.length > 1) {
-      controls.push({
-        name: 'quality',
-        position: 'right',
-        index: 10,
-        style: { marginRight: "10px" },
-        html: defaultQuality!.html,
-        selector: qualities,
-        onSelect: function (item: any, $dom: HTMLElement) {
-          settingsStore.quality = item.html;
-          this.type = item.type;
-          this.switchQuality(item.url);
-          return item.html;
-        },
-      });
-    }
-
-    if (!defaultQuality!.url.startsWith("/@")) {
+    if (videoDetail.value.provider === "AliyundriveOpen" && !currentQuality!.url.startsWith("/@")) {
       alert.value.type = "warning";
       alert.value.visible = true;
       alert.value.title = "后台服务加载失败";
@@ -486,12 +563,32 @@ async function videoInit() {
     playerInstance.value = new Artplayer({
       container: playerDomRef.value,
       id: currentPath.value,
-      url: defaultQuality!.url,
-      type: defaultQuality!.type,
+      url: currentQuality!.url,
+      type: currentQuality!.type,
       customType: {
-        m3u8: playM3u8,
+        m3u8: (video: HTMLVideoElement, url: string, art: Artplayer) => {
+          if (Hls.isSupported()) {
+            if (!hls || videoDetail.value.provider === "AliyundriveOpen") {
+              hls = new Hls();
+              hls.loadSource(url);
+              control.hls = hls;
+            }
+            if (videoDetail.value.provider === "139Yun") {
+              hls.currentLevel = control.currentSelector.level;
+            }
+            hls.attachMedia(video);
+            art.once('destroy', () => hls.destroy());
+          } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = url;
+          } else {
+            alert.value.visible = true;
+            alert.value.type = "error";
+            alert.value.title = "视频播放失败";
+            alert.value.text = '浏览器不支持播放此格式：m3u8';
+          }
+        },
       },
-      controls,
+      controls: [control.control],
       setting: true,
       pip: true,
       playbackRate: true,
@@ -504,37 +601,25 @@ async function videoInit() {
       lang: navigator.language.toLowerCase(),
     });
 
+    control.art = playerInstance.value;
+    control.hls = hls;
+
     playerInstance.value.on('fullscreenWeb', (state) => {
       document.getElementsByTagName("html")[0].style.overflowY = state ? "hidden" : null;
     });
 
     const artPlayerReadyPromise = new Promise<void>((resolve, reject) => {
       playerInstance.value?.once("ready", resolve);
-      playerInstance.value?.once("error", (event) => {
+      playerInstance.value?.once("error", (event: any) => {
         alert.value.visible = true;
+        console.log(event?.target?.error);
         if (qualities.length > 1) {
           alert.value.type = "warning";
           alert.value.text = "已自动切换可播放的转码源";
-          alert.value.title = "浏览器不支持播放此视频的原画画质"
-          const item = qualities[1];
-          item.default = true;
-          playerInstance.value.type = item.type;
-          playerInstance.value.url = item.url;
+          alert.value.title = "浏览器不支持播放此视频的原画画质";
+          control.switch(1);
           qualities.splice(0, 1);
-          playerInstance.value.controls.update({
-            name: 'quality',
-            position: 'right',
-            index: 10,
-            style: { marginRight: "10px" },
-            html: item!.html,
-            selector: qualities,
-            onSelect: function (item: any, $dom: HTMLElement) {
-              settingsStore.quality = item.html;
-              this.type = item.type;
-              this.switchQuality(item.url);
-              return item.html;
-            },
-          });
+          control.update(qualities);
         } else {
           alert.value.type = "error";
           alert.value.text = "视频格式不受支持";
@@ -630,13 +715,13 @@ async function videoInit() {
     videoLoading.value.text = "加载视频数据";
     // await artPlayerReadyPromise;
     playerInstance.value.on("video:timeupdate", updateVideoHistory);
-    playerInstance.value.on("error", (event) => {
-      console.error("视频播放发生错误", event);
-      alert.value.visible = true;
-      alert.value.type = "error";
-      alert.value.title = "视频播放时发生错误";
-      alert.value.text = "请刷新页面重试"
-    });
+    // playerInstance.value.on("error", (event) => {
+    // console.error("视频播放发生错误", event);
+    // alert.value.visible = true;
+    // alert.value.type = "error";
+    // alert.value.title = "视频播放时发生错误";
+    // alert.value.text = "请刷新页面重试"
+    // });
     playerInstance.value.on("video:ended", (event) => {
       if (autoNext.value) {
         router.push(nextVideoFile);

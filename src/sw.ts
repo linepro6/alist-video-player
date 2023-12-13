@@ -64,7 +64,7 @@ async function handleAPIGetRequest(request: Request) {
   const data = await resp.json();
   if (videoExts.includes(pathLib.extname(filePath).toLowerCase())) {
     const rawUrl = data?.data?.raw_url;
-    if (rawUrl) {
+    if (rawUrl && data?.data?.provider === "AliyundriveOpen") {
       rawCache.set(filePath, rawUrl);
       // @ts-ignore
       data.data.raw_url = pathLib.join("/@raw", filePath);
@@ -82,7 +82,7 @@ async function handleAPIVideoPreviewRequest(request: Request) {
   }
   const filePath = reqContent.path;
   const data = await resp.json();
-  if (data.code === 200) {
+  if (data.code === 200 && data?.data?.video_preview_play_info) {
     for (const item of data.data.video_preview_play_info.live_transcoding_task_list) {
       transCodingCache.set(pathLib.join(filePath, item.template_id), item.url);
       item.url = pathLib.join("/@m3u8", filePath, item.template_id, "media.m3u8");
